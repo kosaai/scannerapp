@@ -1,0 +1,253 @@
+name: Build unsigned iPhone IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: iPhone arm64 · Xcode 26 · unsigned
+    runs-on: macos-26
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      PROJECT: DocumentScannerApp.xcodeproj
+      SCHEME: DocumentScannerApp
+      APP_NAME: DocumentScannerApp
+      IPA_NAME: ScannerApp-Home-Unsigned.ipa
+
+    steps:
+      - name: Require main
+        run: test "$GITHUB_REF" = refs/heads/main
+
+      - name: Check out the dispatched commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Select and verify Xcode 26 and iPhone SDK
+        run: |
+          set -euo pipefail
+          DEVELOPER_DIR=$(python3 - <<'PY'
+          from pathlib import Path
+          import re
+          candidates = []
+          for app in Path('/Applications').glob('Xcode_26*.app'):
+              match = re.fullmatch(r'Xcode_(26(?:\.\d+)*).app', app.name)
+              developer = app / 'Contents/Developer'
+              if match and developer.is_dir():
+                  candidates.append((tuple(map(int, match[1].split('.'))), developer))
+          if not candidates:
+              raise SystemExit('No stable Xcode 26 installation found; refusing another major version')
+          print(max(candidates)[1])
+          PY
+          )
+          export DEVELOPER_DIR
+          printf 'DEVELOPER_DIR=%s\n' "$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcodebuild -version | python3 -c 'import sys; assert sys.stdin.readline().startswith("Xcode 26."), "Xcode 26 is required"'
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --find clang
+          printf 'BUILD_ROOT=%s\n' "$RUNNER_TEMP/scanner-unsigned" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/scanner-unsigned"
+
+      - name: Install and verify XcodeGen
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Verify source specification and required resources
+        run: |
+          set -euo pipefail
+          ruby -rjson -ryaml -e 'puts JSON.generate(YAML.load_file("project.yml"))' > "$BUILD_ROOT/spec.json"
+          python3 - <<'PY'
+          import json, os, plistlib, struct
+          from pathlib import Path
+          spec = json.loads((Path(os.environ['BUILD_ROOT']) / 'spec.json').read_text())
+          assert spec['name'] == 'DocumentScannerApp'
+          target = spec['targets']['DocumentScannerApp']
+          assert target['type'] == 'application' and target['platform'] == 'iOS'
+          assert any(source['path'] == 'DocumentScannerApp' for source in target['sources'])
+          assert target['settings']['base']['PRODUCT_BUNDLE_IDENTIFIER'] == 'com.tertiaryinfotech.scannerapp'
+          root = Path('DocumentScannerApp')
+          for name in ('App/DocumentScannerApp.swift', 'Views/HomeView.swift',
+                       'Views/Components/ScannerTheme.swift', 'Views/Components/HomeDocumentComponents.swift',
+                       'Views/Components/HomeScanButtonLabel.swift', 'Resources/Assets.xcassets/Contents.json'):
+              assert (root / name).is_file(), f'Missing required source/resource: {name}'
+          info = plistlib.loads(Path(target['info']['path']).read_bytes())
+          for key in ('NSCameraUsageDescription', 'NSPhotoLibraryUsageDescription', 'NSPhotoLibraryAddUsageDescription'):
+              assert info.get(key), f'Missing purpose string: {key}'
+          privacy = root / 'Resources/PrivacyInfo.xcprivacy'
+          assert isinstance(plistlib.loads(privacy.read_bytes()), dict)
+          assets = root / 'Resources/Assets.xcassets'
+          iconset = assets / 'AppIcon.appiconset'
+          icons = json.loads((iconset / 'Contents.json').read_text())
+          assert icons['images'], 'AppIcon set is empty'
+          for image in icons['images']:
+              if 'filename' in image:
+                  image_path = iconset / image['filename']
+                  data = image_path.read_bytes()
+                  assert data[:8] == b'\x89PNG\r\n\x1a\n', f'Invalid PNG: {image_path}'
+                  assert struct.unpack('>II', data[16:24]) == (1024, 1024), 'Expected 1024px app icon'
+          accent = json.loads((assets / 'AccentColor.colorset/Contents.json').read_text())
+          assert accent['colors'], 'AccentColor set is empty'
+          print('Verified application specification, Home sources, purpose strings, privacy manifest and assets')
+          PY
+
+      - name: Generate project and verify scheme, target and build phases
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          test -f "$PROJECT/project.pbxproj"
+          xcodebuild -list -json -project "$PROJECT" > "$BUILD_ROOT/project-info.json"
+          plutil -convert json -o "$BUILD_ROOT/pbx.json" "$PROJECT/project.pbxproj"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['BUILD_ROOT'])
+          project = json.loads((root / 'project-info.json').read_text())['project']
+          assert 'DocumentScannerApp' in project['targets'], 'Missing application target'
+          assert 'DocumentScannerApp' in project['schemes'], 'Missing application scheme'
+          objects = json.loads((root / 'pbx.json').read_text())['objects']
+          target = next(obj for obj in objects.values()
+                        if obj.get('isa') == 'PBXNativeTarget' and obj.get('name') == 'DocumentScannerApp')
+          assert target['productType'] == 'com.apple.product-type.application'
+          phases = [objects[phase] for phase in target['buildPhases']]
+          def filenames(kind):
+              return {Path(objects[objects[file]['fileRef']]['path']).name
+                      for phase in phases if phase['isa'] == kind for file in phase.get('files', [])}
+          resources = filenames('PBXResourcesBuildPhase')
+          assert {'Assets.xcassets', 'PrivacyInfo.xcprivacy'} <= resources, resources
+          sources = filenames('PBXSourcesBuildPhase')
+          expected = {path.name for path in Path('DocumentScannerApp').rglob('*.swift')}
+          assert expected <= sources, f'Sources missing from target: {expected - sources}'
+          print(f'Verified scheme/target, {len(expected)} Swift sources, and required resource build phase')
+          PY
+          xcodebuild -showBuildSettings -json -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            > "$BUILD_ROOT/build-settings.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          settings = json.loads((Path(os.environ['BUILD_ROOT']) / 'build-settings.json').read_text())
+          app = next(item['buildSettings'] for item in settings if item['target'] == 'DocumentScannerApp')
+          assert app['FULL_PRODUCT_NAME'] == 'DocumentScannerApp.app'
+          assert app['ARCHS'].split() == ['arm64'], app['ARCHS']
+          assert 'iphoneos' in app['SDKROOT'].lower(), app['SDKROOT']
+          assert app['CODE_SIGNING_ALLOWED'] == 'NO' and app['CODE_SIGNING_REQUIRED'] == 'NO'
+          assert not app.get('CODE_SIGN_IDENTITY'), 'Signing identity must be empty'
+          print('Verified Release iphoneos/arm64 build settings with signing disabled')
+          PY
+
+      - name: Resolve package dependencies
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies -project "$PROJECT" -scheme "$SCHEME" \
+            -clonedSourcePackagesDirPath "$BUILD_ROOT/SourcePackages"
+
+      - name: Build Release for real iPhone arm64 without signing
+        run: |
+          set -euo pipefail
+          xcodebuild build -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$BUILD_ROOT/DerivedData" \
+            -clonedSourcePackagesDirPath "$BUILD_ROOT/SourcePackages" \
+            -resultBundlePath "$BUILD_ROOT/Build.xcresult" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee "$BUILD_ROOT/xcodebuild.log"
+
+      - name: Verify device app and package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$BUILD_ROOT/DerivedData/Build/Products/Release-iphoneos/$APP_NAME.app"
+          export APP
+          python3 - <<'PY'
+          import os, plistlib, re, subprocess
+          from pathlib import Path
+          app = Path(os.environ['APP'])
+          info = plistlib.loads((app / 'Info.plist').read_bytes())
+          assert info['CFBundleIdentifier'] == 'com.tertiaryinfotech.scannerapp'
+          assert info['CFBundlePackageType'] == 'APPL'
+          assert 'iPhoneOS' in info['CFBundleSupportedPlatforms']
+          assert info['DTPlatformName'] == 'iphoneos'
+          binary = app / info['CFBundleExecutable']
+          archs = subprocess.check_output(['xcrun', 'lipo', '-archs', str(binary)], text=True).split()
+          assert archs == ['arm64'], archs
+          platform = subprocess.check_output(['xcrun', 'vtool', '-show-build', str(binary)], text=True)
+          assert re.search(r'platform\s+IOS\b', platform), platform
+          assert (app / 'Assets.car').is_file(), 'Compiled asset catalog missing'
+          assert (app / 'PrivacyInfo.xcprivacy').is_file(), 'Privacy manifest missing'
+          assert not list(app.rglob('_CodeSignature')), 'Unexpected signature'
+          assert not list(app.rglob('embedded.mobileprovision')), 'Unexpected provisioning profile'
+          print('Verified unsigned iPhoneOS arm64 application and bundled resources')
+          PY
+          mkdir -p "$BUILD_ROOT/package/Payload"
+          ditto "$APP" "$BUILD_ROOT/package/Payload/$APP_NAME.app"
+          cd "$BUILD_ROOT/package"
+          ditto -c -k --keepParent Payload "$BUILD_ROOT/$IPA_NAME"
+          python3 - <<'PY'
+          import os, plistlib, zipfile
+          from pathlib import Path
+          app = Path(os.environ['APP'])
+          ipa = Path(os.environ['BUILD_ROOT']) / os.environ['IPA_NAME']
+          prefix = 'Payload/DocumentScannerApp.app/'
+          with zipfile.ZipFile(ipa) as archive:
+              assert archive.testzip() is None, 'IPA CRC check failed'
+              names = set(archive.namelist())
+              expected = {prefix + path.relative_to(app).as_posix()
+                          for path in app.rglob('*') if path.is_file() or path.is_symlink()}
+              assert expected <= names, f'Bundle files missing from IPA: {expected - names}'
+              assert all(name.startswith('Payload/') for name in names), 'Unexpected archive root'
+              info = plistlib.loads(archive.read(prefix + 'Info.plist'))
+              assert 'iPhoneOS' in info['CFBundleSupportedPlatforms']
+              assert prefix + info['CFBundleExecutable'] in names
+              assert prefix + 'Assets.car' in names and prefix + 'PrivacyInfo.xcprivacy' in names
+              assert not any('_CodeSignature/' in name or name.endswith('embedded.mobileprovision') for name in names)
+          print(f'Verified IPA CRC, device metadata and complete bundle inventory: {ipa.stat().st_size} bytes')
+          PY
+          shasum -a 256 "$BUILD_ROOT/$IPA_NAME"
+
+      - name: Upload unsigned iPhone IPA
+        id: ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScannerApp-Home-Unsigned
+          path: ${{ env.BUILD_ROOT }}/ScannerApp-Home-Unsigned.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Write signing handoff
+        env:
+          ARTIFACT_URL: ${{ steps.ipa.outputs.artifact-url }}
+        run: |
+          {
+            printf '## Unsigned iPhone IPA\n\n'
+            printf 'Commit: `%s`\n\n' "$GITHUB_SHA"
+            printf '[Download ScannerApp-Home-Unsigned.ipa](%s)\n\n' "$ARTIFACT_URL"
+            printf 'Release · iphoneos · arm64 · Xcode 26 · macos-26\n\n'
+            printf 'Unsigned: external signing and compatible provisioning are required before installation. Sign the app and any embedded extensions/frameworks with matching identifiers and entitlements.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScannerApp-Home-Build-Diagnostics
+          path: |
+            ${{ env.BUILD_ROOT }}/*.log
+            ${{ env.BUILD_ROOT }}/*.json
+            ${{ env.BUILD_ROOT }}/Build.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
